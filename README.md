@@ -1,444 +1,161 @@
-import { useEffect, useState, useCallback } from 'react';
-import jsPDF from 'jspdf';
-import html2canvas from 'html2canvas';
-import logo from './assets/itc-logo.png';
-import './App.css';
+import random
+from django.core.cache import cache
+from django.db import connection
+from django.db.models import Q
+from rest_framework import status
+from rest_framework.decorators import api_view
+from rest_framework.response import Response
+from .models import Student
 
-function App() {
-  const FRONTEND_URL = 'https://squiggly-happier-handful.ngrok-free.dev';
-  const BACKEND_URL = window.location.origin;
 
-  const [studentId, setStudentId] = useState('');
-  const [mobile, setMobile] = useState('');
-  const [otp, setOtp] = useState('');
-  const [student, setStudent] = useState(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState('');
-  const [flowStep, setFlowStep] = useState('id_search');
-  const [isQrScan, setIsQrScan] = useState(false);
-  const [isMobileDevice, setIsMobileDevice] = useState(() => {
-    if (typeof window === 'undefined') return false;
-    return window.innerWidth <= 768 || /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
-  });
+def _get_student_course_info(student_id):
+    clean_id = str(student_id or '').strip()
+    if not clean_id:
+        return {'certificate_url': '', 'course_id': ''}
 
-  useEffect(() => {
-    const checkMobile = () => {
-      setIsMobileDevice(
-        window.innerWidth <= 768 || /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent)
-      );
-    };
-    checkMobile();
-    window.addEventListener('resize', checkMobile);
-    return () => window.removeEventListener('resize', checkMobile);
-  }, []);
+    certificate_url = ''
+    course_id = ''
 
-  const lookupById = useCallback(
-    async (overrideId) => {
-      const cleanId = String(overrideId ?? studentId).trim();
-      if (!cleanId) {
-        setError('Please enter Student ID');
-        return;
-      }
+    # Try fetching both CertificateUrl and CourseId from dbo.a_StudentCourse
+    try:
+        sql_with_course = """
+            SELECT TOP 1
+                CertificateUrl,
+                CourseId
+            FROM dbo.a_StudentCourse
+            WHERE CAST(StudentId AS NVARCHAR(100)) = %s
+            ORDER BY
+                CASE WHEN CourseId IS NOT NULL AND LTRIM(RTRIM(CAST(CourseId AS NVARCHAR(100)))) <> '' THEN 0 ELSE 1 END,
+                CASE WHEN CertificateUrl IS NOT NULL AND LTRIM(RTRIM(CAST(CertificateUrl AS NVARCHAR(MAX)))) <> '' THEN 0 ELSE 1 END
+        """
+        with connection.cursor() as cursor:
+            cursor.execute(sql_with_course, [clean_id])
+            row = cursor.fetchone()
 
-      setLoading(true);
-      setError('');
-      setStudent(null);
+        if row:
+            certificate_url = str(row[0] or '').strip()
+            course_id = str(row[1] or '').strip()
+        return {'certificate_url': certificate_url, 'course_id': course_id}
+    except Exception:
+        # Fallback to your original CertificateUrl query if CourseId column is not present
+        pass
 
-      try {
-        const response = await fetch(`${BACKEND_URL}/api/lookup-student/`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'ngrok-skip-browser-warning': 'true',
-          },
-          body: JSON.stringify({ student_id: cleanId }),
-        });
+    sql_cert_only = """
+        SELECT TOP 1
+            StudentId,
+            CertificateUrl
+        FROM dbo.a_StudentCourse
+        WHERE CAST(StudentId AS NVARCHAR(100)) = %s
+          AND CertificateUrl IS NOT NULL
+          AND LTRIM(RTRIM(CAST(CertificateUrl AS NVARCHAR(MAX)))) <> ''
+    """
+    with connection.cursor() as cursor:
+        cursor.execute(sql_cert_only, [clean_id])
+        row = cursor.fetchone()
 
-        const data = await response.json();
+    if row:
+        certificate_url = str(row[1] or '').strip()
 
-        if (!response.ok) {
-          setFlowStep('mobile_input');
-          setError(data.error || 'Student ID not found. Please verify with your Mobile Number.');
-          return;
-        }
+    return {'certificate_url': certificate_url, 'course_id': ''}
 
-        setStudent(data);
-      } catch {
-        setError('Unable to connect to the backend server. Please check if Django is running.');
-      } finally {
-        setLoading(false);
-      }
-    },
-    [BACKEND_URL, studentId]
-  );
 
-  useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    const qrFlag = params.get('qr') || params.get('from_qr') || params.get('scan');
-    const referrerIsQr = typeof document !== 'undefined' && /qr/i.test(document.referrer || '');
-    const scannedQr = qrFlag === '1' || qrFlag === 'true' || referrerIsQr;
-    setIsQrScan(scannedQr);
+def format_student_payload(student):
+    clean_id = str(student.student_id).strip()
+    clean_mobile = str(student.mobile).strip() if student.mobile else ''
+    course_info = _get_student_course_info(clean_id)
+    schedule_url = (
+        f"http://lms.itcmogri.org:801/Admin/a_publicSec.aspx?StudentId={clean_id}&CourseId={course_info['course_id']}"
+        if course_info['course_id']
+        else ''
+    )
 
-    const paramId = (params.get('studentId') || params.get('StudentId') || params.get('id') || '').trim();
-    if (paramId) {
-      setStudentId(paramId);
-      lookupById(paramId);
-    }
-  }, [lookupById]);
-
-  const sendOtp = async () => {
-    const cleanMobile = mobile.trim();
-    if (!cleanMobile || cleanMobile.length < 10) {
-      setError('Please enter a valid mobile number');
-      return;
+    return {
+        'student_id': clean_id,
+        'name': student.full_name,
+        'first_name': (student.first_name or '').strip(),
+        'middle_name': (student.middle_name or '').strip(),
+        'last_name': (student.last_name or '').strip(),
+        'mobile': clean_mobile,
+        'course_id': course_info['course_id'],
+        'schedule_url': schedule_url,
+        'certificate_url': course_info['certificate_url'],
     }
 
-    setLoading(true);
-    setError('');
 
-    try {
-      const response = await fetch(`${BACKEND_URL}/api/send-otp/`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'ngrok-skip-browser-warning': 'true',
+@api_view(['POST'])
+def lookup_student(request):
+    raw_id = request.data.get('student_id')
+    if not raw_id:
+        return Response({'error': 'Student ID is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+    str_id = str(raw_id).strip()
+    query = Q(student_id__iexact=str_id) | Q(student_id=str_id)
+    if str_id.isdigit():
+        try:
+            query |= Q(student_id=int(str_id))
+        except ValueError:
+            pass
+
+    student = Student.objects.filter(query).first()
+    if not student:
+        return Response(
+            {
+                'error': 'Student ID not found',
+                'requires_otp': True,
+                'message': 'ID not found in direct records. Please verify with your Mobile Number.',
+            },
+            status=status.HTTP_404_NOT_FOUND,
+        )
+
+    return Response(format_student_payload(student), status=status.HTTP_200_OK)
+
+
+@api_view(['POST'])
+def send_otp(request):
+    mobile = request.data.get('mobile')
+    if not mobile:
+        return Response({'error': 'Mobile number is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+    clean_mobile = str(mobile).strip()
+    student = Student.objects.filter(mobile__icontains=clean_mobile).first()
+    if not student:
+        return Response({'error': 'Mobile number not found in database'}, status=status.HTTP_404_NOT_FOUND)
+
+    otp = str(random.randint(100000, 999999))
+    cache.set(f'otp_{clean_mobile}', otp, timeout=300)
+    print(f'OTP for {clean_mobile} is: {otp}')
+
+    return Response(
+        {
+            'message': 'OTP sent successfully',
+            'mobile': clean_mobile,
+            'debug_otp': otp,
         },
-        body: JSON.stringify({ mobile: cleanMobile }),
-      });
+        status=status.HTTP_200_OK,
+    )
 
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || 'Failed to send OTP');
 
-      setFlowStep('otp_input');
-      setError('');
-      alert(`OTP sent successfully! (Debug OTP: ${data.debug_otp})`);
-    } catch (err) {
-      setError(err.message || 'Mobile number not found in database');
-    } finally {
-      setLoading(false);
-    }
-  };
+@api_view(['POST'])
+def verify_otp(request):
+    mobile = request.data.get('mobile')
+    otp = request.data.get('otp')
 
-  const verifyOtp = async () => {
-    const cleanOtp = otp.trim();
-    if (!cleanOtp || cleanOtp.length !== 6) {
-      setError('Please enter a valid 6-digit OTP');
-      return;
-    }
+    if not mobile or not otp:
+        return Response({'error': 'Mobile and OTP are required'}, status=status.HTTP_400_BAD_REQUEST)
 
-    setLoading(true);
-    setError('');
+    clean_mobile = str(mobile).strip()
+    clean_otp = str(otp).strip()
+    saved_otp = cache.get(f'otp_{clean_mobile}')
 
-    try {
-      const response = await fetch(`${BACKEND_URL}/api/verify-otp/`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'ngrok-skip-browser-warning': 'true',
-        },
-        body: JSON.stringify({ mobile: mobile.trim(), otp: cleanOtp }),
-      });
+    if not saved_otp:
+        return Response({'error': 'OTP expired or not found'}, status=status.HTTP_400_BAD_REQUEST)
 
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || 'Invalid OTP');
+    if str(saved_otp) != clean_otp:
+        return Response({'error': 'Invalid OTP'}, status=status.HTTP_400_BAD_REQUEST)
 
-      setStudent(data);
-      setError('');
-    } catch (err) {
-      setError(err.message || 'Verification failed');
-    } finally {
-      setLoading(false);
-    }
-  };
+    student = Student.objects.filter(mobile__icontains=clean_mobile).first()
+    if not student:
+        return Response({'error': 'Student profile not found'}, status=status.HTTP_404_NOT_FOUND)
 
-  const getScheduleUrl = () => {
-    if (!student) return '';
-    const resolvedCourseId = String(student.course_id || '').trim();
-    if (resolvedCourseId) {
-      return `http://lms.itcmogri.org:801/Admin/a_publicSec.aspx?StudentId=${encodeURIComponent(
-        student.student_id
-      )}&CourseId=${encodeURIComponent(resolvedCourseId)}`;
-    }
-    if (student.schedule_url) return student.schedule_url;
-    return `http://lms.itcmogri.org:801/Admin/a_publicSec.aspx?StudentId=${encodeURIComponent(
-      student.student_id
-    )}`;
-  };
-
-  const openStudentSchedule = (e) => {
-    if (e) e.preventDefault();
-    const schedUrl = getScheduleUrl();
-    if (!schedUrl) {
-      setError('Schedule link is not available for this student.');
-      return;
-    }
-    setError('');
-    window.location.assign(schedUrl);
-  };
-
-  const getCertificateFileUrl = () => {
-    const rawUrl = (student?.certificate_url || '').trim();
-    if (!rawUrl) return '';
-    if (/^https?:\/\//i.test(rawUrl)) return rawUrl;
-    const baseUrl = 'https://lms.itcmogri.org:801/StudentCertificate';
-    const cleanPath = rawUrl.replace(/^\/+/, '').replace(/^StudentCertificate\/+/i, '');
-    return `${baseUrl}/${cleanPath}`;
-  };
-
-  const downloadCertificate = async () => {
-    const certUrl = getCertificateFileUrl();
-    if (certUrl) {
-      window.open(certUrl, '_blank', 'noopener,noreferrer');
-      return;
-    }
-
-    const element = document.getElementById('certificate');
-    if (!element || !student) return;
-
-    const canvas = await html2canvas(element, {
-      scale: 2,
-      useCORS: true,
-    });
-
-    const imgData = canvas.toDataURL('image/png');
-    const pdf = new jsPDF('landscape', 'mm', 'a4');
-    const imgWidth = 297;
-    const imgHeight = (canvas.height * imgWidth) / canvas.width;
-
-    pdf.addImage(imgData, 'PNG', 0, 0, imgWidth, imgHeight);
-    pdf.save(`${student.student_id}_Certificate.pdf`);
-  };
-
-  const qrTargetUrl = `${FRONTEND_URL}/?qr=1`;
-
-  return (
-    <div className="container">
-      <div className="card">
-        <div className="logo-section">
-          <img src={logo} alt="ITC Logo" className="logo" />
-          <h1>Information Technology Centre</h1>
-          <p>{isQrScan ? 'Student Schedule Lookup' : 'Secure Certificate Verification'}</p>
-        </div>
-
-        {!student && (
-          <>
-            {flowStep === 'id_search' && (
-              <>
-                <div className="form-group">
-                  <label>Enter Student ID</label>
-                  <input
-                    type="text"
-                    placeholder="ENTER ID"
-                    value={studentId}
-                    onChange={(e) => setStudentId(e.target.value)}
-                    onKeyDown={(e) => e.key === 'Enter' && lookupById()}
-                  />
-                </div>
-
-                <button className="btn-primary" onClick={() => lookupById()} disabled={loading}>
-                  {loading ? 'Searching...' : 'Lookup Student'}
-                </button>
-              </>
-            )}
-
-            {flowStep === 'mobile_input' && (
-              <>
-                <div className="form-group">
-                  <label>Enter Mobile Number</label>
-                  <input
-                    type="text"
-                    placeholder="Enter registered mobile"
-                    value={mobile}
-                    onChange={(e) => setMobile(e.target.value)}
-                    onKeyDown={(e) => e.key === 'Enter' && sendOtp()}
-                  />
-                </div>
-
-                <button className="btn-primary" onClick={sendOtp} disabled={loading}>
-                  {loading ? 'Sending OTP...' : 'Send OTP'}
-                </button>
-
-                <button
-                  className="btn-secondary"
-                  style={{ marginTop: '10px' }}
-                  onClick={() => {
-                    setFlowStep('id_search');
-                    setError('');
-                  }}
-                >
-                  Back to ID Search
-                </button>
-              </>
-            )}
-
-            {flowStep === 'otp_input' && (
-              <>
-                <div className="form-group">
-                  <label>Enter 6-Digit OTP sent to {mobile}</label>
-                  <input
-                    type="text"
-                    placeholder="Enter or paste OTP"
-                    maxLength="6"
-                    value={otp}
-                    onChange={(e) => setOtp(e.target.value)}
-                    onKeyDown={(e) => e.key === 'Enter' && verifyOtp()}
-                  />
-                </div>
-
-                <button className="btn-primary" onClick={verifyOtp} disabled={loading}>
-                  {loading ? 'Verifying...' : 'Verify OTP'}
-                </button>
-              </>
-            )}
-
-            {error && <p className="error-text" style={{ marginTop: '15px' }}>{error}</p>}
-          </>
-        )}
-
-        {student && (
-          <div className="student-details">
-            <h2>Student Details</h2>
-
-            <table className="details-table">
-              <tbody>
-                <tr>
-                  <td>Student ID</td>
-                  <td><strong>{student.student_id}</strong></td>
-                </tr>
-                <tr>
-                  <td>Student Name</td>
-                  <td>{student.name}</td>
-                </tr>
-                <tr>
-                  <td>Mobile No</td>
-                  <td>{student.mobile || '-'}</td>
-                </tr>
-              </tbody>
-            </table>
-
-            {error && <p className="error-text" style={{ marginBottom: '12px' }}>{error}</p>}
-
-            <div className="action-buttons" style={{ marginTop: '20px' }}>
-              {isQrScan ? (
-                isMobileDevice ? (
-                  <a
-                    href={getScheduleUrl()}
-                    className="btn-primary"
-                    style={{ display: 'block', textDecoration: 'none' }}
-                    onClick={openStudentSchedule}
-                  >
-                    Student Schedule
-                  </a>
-                ) : (
-                  <p className="error-text">
-                    Student Schedule is available only on mobile devices.
-                  </p>
-                )
-              ) : (
-                <>
-                  {isMobileDevice && (
-                    <a
-                      href={getScheduleUrl()}
-                      className="btn-primary"
-                      style={{ display: 'block', textDecoration: 'none' }}
-                      onClick={openStudentSchedule}
-                    >
-                      Student Schedule
-                    </a>
-                  )}
-
-                  <button className="btn-primary" onClick={downloadCertificate}>
-                    Download Certificate
-                  </button>
-
-                  <button
-                    className="btn-secondary"
-                    onClick={() => {
-                      setStudent(null);
-                      setStudentId('');
-                      setMobile('');
-                      setOtp('');
-                      setError('');
-                      setFlowStep('id_search');
-                    }}
-                  >
-                    Search Another
-                  </button>
-                </>
-              )}
-            </div>
-          </div>
-        )}
-
-        {!student && !isQrScan && (
-          <div style={{ textAlign: 'center', marginTop: '30px', borderTop: '1px solid #eee', paddingTop: '20px' }}>
-            <img
-              src={`https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=${encodeURIComponent(qrTargetUrl)}`}
-              alt="Portal QR Code"
-              style={{ width: '130px', height: '130px', border: '4px solid white', boxShadow: '0 2px 8px rgba(0,0,0,0.1)' }}
-            />
-          </div>
-        )}
-      </div>
-
-      {!isQrScan && student && (
-        <div
-          id="certificate"
-          style={{
-            width: '1123px',
-            height: '794px',
-            padding: '40px',
-            background: 'white',
-            position: 'absolute',
-            left: '-9999px',
-            top: 0,
-            fontFamily: 'Georgia, serif',
-            border: '14px solid #1e3a8a',
-            boxSizing: 'border-box',
-          }}
-        >
-          <div
-            style={{
-              border: '5px solid #c0a060',
-              height: '100%',
-              padding: '40px',
-              textAlign: 'center',
-              boxSizing: 'border-box',
-            }}
-          >
-            <img src={logo} alt="ITC" style={{ height: '75px', marginBottom: '10px' }} />
-
-            <h1 style={{ color: '#1e3a8a', fontSize: '34px', margin: '8px 0' }}>
-              INFORMATION TECHNOLOGY CENTER
-            </h1>
-
-            <h2 style={{ color: '#b45309', fontSize: '26px', margin: '18px 0' }}>
-              CERTIFICATE OF COMPLETION
-            </h2>
-
-            <p style={{ fontSize: '18px', margin: '20px 0' }}>
-              This is to certify that
-            </p>
-
-            <h2
-              style={{
-                fontSize: '30px',
-                color: '#1e3a8a',
-                margin: '12px 0',
-                textTransform: 'uppercase',
-              }}
-            >
-              {student.name}
-            </h2>
-
-            <p style={{ fontSize: '17px', marginTop: '24px' }}>
-              <strong>Student ID:</strong> {student.student_id}
-            </p>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
-export default App;
+    cache.delete(f'otp_{clean_mobile}')
+    return Response(format_student_payload(student), status=status.HTTP_200_OK)
